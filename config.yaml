@@ -1,0 +1,264 @@
+# ============================================================
+# Mihomo - Docker / LAN 低维护配置
+# 场景：Mihomo 运行在 Docker 中，为局域网设备提供显式 HTTP/SOCKS5 代理
+# ============================================================
+
+# ============================================================
+# 用户参数区（通常只需要修改这里）
+# ============================================================
+subscription-url: &subscription-url "此处改为你的订阅地址"
+
+# ----------------------------
+# 基础监听
+# ----------------------------
+mixed-port: 7990
+allow-lan: true
+bind-address: "*"
+
+# 仅允许常见内网地址访问代理端口，避免直接暴露到公网接口
+lan-allowed-ips:
+  - 127.0.0.0/8
+  - 10.0.0.0/8
+  - 172.17.0.0/16
+  - 192.168.0.0/16
+  - 100.64.0.0/10
+
+authentication:
+  - "admin:Ruijie.com"
+
+skip-auth-prefixes:
+  - 172.17.78.16/32
+  - 10.40.83.122/32
+  - 172.17.78.13/32
+
+mode: rule
+log-level: info
+ipv6: false
+find-process-mode: off
+unified-delay: true
+tcp-concurrent: true
+
+profile:
+  store-selected: true
+
+
+# ----------------------------
+# 管理 API
+# ----------------------------
+# Docker 端口映射建议只发布到宿主机 LAN IP，而不是全部公网接口。
+external-controller: 0.0.0.0:9090
+secret: "Admin123"
+
+external-controller-cors:
+  allow-origins:
+    - "*"
+  allow-private-network: true
+
+
+# ----------------------------
+# DNS
+# ----------------------------
+dns:
+  enable: true
+  ipv6: false
+  cache-algorithm: arc
+
+  # 当前是显式代理，不启用 TUN；redir-host 兼容性好且无需维护 fake-ip 例外。
+  enhanced-mode: redir-host
+  use-hosts: true
+  use-system-hosts: true
+
+  # 用于解析 DoH 上游域名及首次下载规则集。
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+  # 节点域名必须直连解析，避免“解析节点需要先连上节点”的循环依赖。
+  proxy-server-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+
+  # DIRECT 规则命中的域名统一用国内 DNS 重新解析。
+  direct-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  direct-nameserver-follow-policy: false
+
+  # 国内及局域网域名使用国内 DNS；其余域名默认经代理查询境外 DNS。
+  nameserver-policy:
+    "rule-set:private-domain,cn-domain":
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+
+  nameserver:
+    - https://1.1.1.1/dns-query#Proxy
+    - https://8.8.8.8/dns-query#Proxy
+
+
+# ----------------------------
+# 代理提供者（订阅地址保持不变）
+# ----------------------------
+proxy-providers:
+  airport:
+    type: http
+    url: *subscription-url
+    path: ./providers/airport.yaml
+    interval: 3600
+
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      timeout: 5000
+      lazy: true
+      expected-status: 204
+
+
+# ----------------------------
+# 策略组
+# ----------------------------
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - Auto
+      - DIRECT
+    use:
+      - airport
+
+  - name: Auto
+    type: url-test
+    use:
+      - airport
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 80
+
+  # 最终未匹配流量的出口；选择会由 profile.store-selected 持久保存。
+  # Proxy = 未匹配流量走代理，DIRECT = 未匹配流量走直连。
+  - name: 兜底策略
+    type: select
+    proxies:
+      - Proxy
+      - DIRECT
+
+  # 广告规则误杀时可在面板将此组切为 DIRECT，无需修改配置。
+  - name: AdBlock
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+
+
+# ----------------------------
+# 自动更新规则集
+# ----------------------------
+# MRS 体积小、加载快；每天从 MetaCubeX/meta-rules-dat 自动更新。
+# 使用 jsDelivr 镜像，便于大陆网络直连获取。
+rule-providers:
+  # ========================================================
+  # 用户手动规则区（按需取消注释并替换示例地址）
+  # 支持：DOMAIN（完整域名）、DOMAIN-SUFFIX（域名及其子域名）、IP-CIDR。
+  # ========================================================
+  manual-proxy:
+    type: inline
+    behavior: classical
+    payload:
+      # - DOMAIN,www.example.com
+      # - DOMAIN-SUFFIX,example.com
+      # - IP-CIDR,203.0.113.10/32,no-resolve
+      - DOMAIN,manual-proxy-placeholder.invalid
+
+  manual-direct:
+    type: inline
+    behavior: classical
+    payload:
+      # - DOMAIN,www.example.cn
+      # - DOMAIN-SUFFIX,example.cn
+      # - IP-CIDR,192.0.2.10/32,no-resolve
+      - DOMAIN,manual-direct-placeholder.invalid
+
+  private-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    path: ./ruleset/private-domain.mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs"
+    interval: 86400
+    proxy: DIRECT
+
+  private-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    path: ./ruleset/private-ip.mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs"
+    interval: 86400
+    proxy: DIRECT
+
+  ads-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    path: ./ruleset/ads-domain.mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-ads-all.mrs"
+    interval: 86400
+    proxy: DIRECT
+
+  proxy-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    path: ./ruleset/proxy-domain.mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/geolocation-!cn.mrs"
+    interval: 86400
+    proxy: DIRECT
+
+  cn-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    path: ./ruleset/cn-domain.mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs"
+    interval: 86400
+    proxy: DIRECT
+
+  cn-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    path: ./ruleset/cn-ip.mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs"
+    interval: 86400
+    proxy: DIRECT
+
+
+# ----------------------------
+# 规则（自上而下匹配）
+# ----------------------------
+rules:
+  # 本机 / 局域网优先直连，确保规则集尚未下载时仍可访问内网。
+  - DOMAIN-SUFFIX,local,DIRECT
+  - DOMAIN-SUFFIX,lan,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+
+  - RULE-SET,private-domain,DIRECT
+  - RULE-SET,private-ip,DIRECT,no-resolve
+
+  # 手动规则优先于广告、海外和大陆自动规则。
+  - RULE-SET,manual-proxy,Proxy
+  - RULE-SET,manual-direct,DIRECT
+
+  # 广告优先于国内域名规则，默认拒绝；可通过 AdBlock 组临时放行。
+  - RULE-SET,ads-domain,AdBlock
+
+  # 明确的海外域名始终代理，明确的大陆域名/IP 始终直连。
+  # 未命中规则的流量由“兜底策略”决定：直连或代理。
+  - RULE-SET,proxy-domain,Proxy
+  - RULE-SET,cn-domain,DIRECT
+  - RULE-SET,cn-ip,DIRECT,no-resolve
+  - MATCH,兜底策略
